@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 from plumbum import local
 import os
 import redis
@@ -67,35 +67,50 @@ class DynoSpec(namedtuple('DynoSpec', 'ip dnode_port client_port rack dc token '
             yaml.dump(config, fh, default_flow_style=False)
         return filename
 
-class DynoCluster(object):
-    def __init__(self, request_file, ips):
-        # Load the YAML file describing the cluster.
-        with open(request_file, 'r') as fh:
-            self.request = yaml.load(fh)
 
+class DynoCluster(object):
+    def __init__(self, request, counts_by_dc, counts_by_rack, specs, ips, launch_nodes=True):
+        self.request = request
+        self.counts_by_dc = counts_by_dc
+        self.counts_by_rack = counts_by_rack
+        self.specs = specs
         self.ips = ips
         self.nodes = []
-        self.counts_by_dc = {}
-        self.counts_by_rack = {}
+        self.launch_nodes = launch_nodes
+
+    @classmethod
+    def fromRequestAndIPs(cls, request_file, ips):
+        # Load the YAML file describing the cluster.
+        with open(request_file, 'r') as fh:
+            request = yaml.safe_load(fh)
+
         # Generate the specification for each node to be started in the cluster.
-        self.specs = list(self._generate_dynomite_specs())
+        tokens = tokens_for_cluster(request['cluster_desc'], None)
+        counts_by_rack = dict_request(request['cluster_desc'], 'name', 'racks')
+        counts_by_dc = sum_racks(counts_by_rack)
+        specs = _generate_dynomite_specs(tokens, ips, counts_by_rack, counts_by_dc, request['conf'])
+        return cls(
+            request=request,
+            counts_by_dc=counts_by_dc,
+            counts_by_rack=counts_by_rack,
+            specs=specs,
+            ips=ips,
+        )
 
-    def _generate_dynomite_specs(self):
-        tokens = tokens_for_cluster(self.request['cluster_desc'], None)
-        self.counts_by_rack = dict_request(self.request['cluster_desc'], 'name', 'racks')
-        self.counts_by_dc = sum_racks(self.counts_by_rack)
-        total_nodes = sum(self.counts_by_dc.values())
-
-        for dc, racks in tokens:
-            dc_count = self.counts_by_dc[dc]
-            rack_count = self.counts_by_rack[dc]
-            remote_count = total_nodes - dc_count
-            for rack, tokens in racks:
-                local_count = rack_count[rack] - 1
-                for token in tokens:
-                    ip = next(self.ips)
-                    yield DynoSpec(ip, INTERNODE_LISTEN, CLIENT_LISTEN, rack, dc, token,
-                        local_count, remote_count, self.request['conf'])
+    @classmethod
+    def fromDynomiteSpecs(cls, specs, launch_nodes):
+        request = _request_from_specs(specs)
+        counts_by_rack = dict_request(request['cluster_desc'], 'name', 'racks')
+        counts_by_dc = sum_racks(counts_by_rack)
+        ips = [s.ip for s in specs]
+        return cls(
+            request=request,
+            counts_by_dc=counts_by_dc,
+            counts_by_rack=counts_by_rack,
+            specs=specs,
+            ips=ips,
+            launch_nodes=launch_nodes,
+        )
 
     def _get_cluster_desc_yaml(self):
         yaml_desc = dict(test_dir=str(local.cwd))
@@ -128,8 +143,8 @@ class DynoCluster(object):
                 # Nested loop is okay here since the #nodes will always be small.
                 for node in self.nodes:
                     if node.spec.dc == dc and node.spec.rack == rack:
-                        print("\t\t\tNode: %s  || PID: %s" % (node.name, \
-                            node.get_dyno_node_pid()))
+                        pid = node.get_dyno_node_pid() if self.launch_nodes else -1
+                        print("\t\t\tNode: %s  || PID: %s" % (node.name, pid))
 
     def _delete_running_cluster_file(self):
         os.remove(CLUSTER_DESC_FILEPATH)
@@ -140,14 +155,19 @@ class DynoCluster(object):
         seeds_list = [spec.seed_string for spec in self.specs]
         # Launch each individual Dyno node.
         self.nodes = [DynoNode(spec, seeds_list) for spec in self.specs]
-        for n in self.nodes:
-            n.launch()
+        if self.launch_nodes:
+            for n in self.nodes:
+                n.launch()
 
-        # Now that the cluster is up, write its description to a file.
-        self._write_running_cluster_file()
+            # Now that the cluster is up, write its description to a file.
+            self._write_running_cluster_file()
+
         self._print_cluster_topology()
 
     def teardown(self):
+        if not self.launch_nodes:
+            return
+
         for n in self.nodes:
             n.teardown()
 
@@ -214,3 +234,40 @@ class DynoCluster(object):
             if self._is_node_in_multi_rack_dc(node) == True:
                 return node.get_connection()
         return None
+
+
+def _generate_dynomite_specs(tokens, ips, counts_by_rack, counts_by_dc, conf):
+    total_nodes = sum(counts_by_dc.values())
+    specs = []
+    for dc, racks in tokens:
+        dc_count = counts_by_dc[dc]
+        rack_count = counts_by_rack[dc]
+        remote_count = total_nodes - dc_count
+        for rack, tokens in racks:
+            local_count = rack_count[rack] - 1
+            for token in tokens:
+                ip = next(ips)
+                spec = DynoSpec(ip, INTERNODE_LISTEN, CLIENT_LISTEN, rack, dc, token,
+                                local_count, remote_count, conf)
+                specs.append(spec)
+    return specs
+
+
+def _request_from_specs(specs):
+    nodes_per_dc = defaultdict(list)
+    for s in specs:
+        nodes_per_dc[s.dc].append(s)
+
+    cluster = []
+    for dc, nodes in nodes_per_dc.items():
+        nodes_per_rack = defaultdict(int)
+        for n in nodes:
+            nodes_per_rack[n.rack] += 1
+        cluster.append({
+            'name': dc,
+            'racks': list(nodes_per_rack.items())
+        })
+    return {
+        'conf': specs[0].req_conf,
+        'cluster_desc': cluster
+    }
