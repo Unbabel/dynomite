@@ -10,7 +10,7 @@ import yaml
 
 from plumbum import local
 
-from dyno_cluster import DynoCluster
+from dyno_cluster import DynoCluster, DynoSpec
 from func_test import comparison_test
 from utils import generate_ips, setup_temp_dir, sleep_with_animation
 from redis_node import RedisNode
@@ -23,22 +23,21 @@ def main():
     parser = argparse.ArgumentParser(
         description='Autogenerates a Dynomite cluster and runs functional ' +
             'tests against it')
-    parser.add_argument('request_file', default='test/no_quorum_request.yaml',
+    parser.add_argument('dynospec_file', default='test/dyno_spec_file.yaml',
         help='YAML file describing desired cluster', nargs='?')
     args = parser.parse_args()
 
     # Setup a temporary directory to store logs and configs for this cluster.
     temp = setup_temp_dir()
 
-    # Generate IP addresses to be used by the nodes we will create.
-    ips = generate_ips()
+    specs = parse_dynospec_file(args.dynospec_file)
 
     # Create a standalone Redis node.
-    standalone_redis_ip = next(ips)
+    standalone_redis_ip = redis_ip(len(specs))
     standalone_redis = RedisNode(standalone_redis_ip, REDIS_PORT)
 
     # Create a Dynomite cluster.
-    dynomite_cluster = DynoCluster.fromRequestAndIPs(args.request_file, ips)
+    dynomite_cluster = DynoCluster.fromDynomiteSpecs(specs, launch_nodes=False)
 
     with ExitStack() as stack:
         # Make sure to change the working directory to the temp dir before running the
@@ -57,6 +56,18 @@ def main():
         random_node = random.choice(dynomite_cluster.nodes)
         stats_url = 'http://{}:{}/info'.format(random_node.ip, STATS_PORT)
         json.loads(urlopen(stats_url).read().decode('ascii'))
+
+
+def redis_ip(dyno_node_count):
+    assert dyno_node_count < 254
+    return "127.0.0.254"
+
+
+def parse_dynospec_file(filename):
+    with open(filename, 'r') as f:
+        specs = yaml.safe_load(f)
+    return [DynoSpec(**dct) for dct in specs]
+
 
 if __name__ == '__main__':
     sys.exit(main())
